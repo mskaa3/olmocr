@@ -778,7 +778,7 @@ def submit_beaker_job(args):
 def print_stats(args):
     LONG_CONTEXT_THRESHOLD = 32768
 
-    assert args.workspace.startswith("s3://"), "Printing stats functionality only works with s3 workspaces for now."
+    # assert args.workspace.startswith("s3://"), "Printing stats functionality only works with s3 workspaces for now."
 
     # Get total work items and completed items
     index_file_s3_path = os.path.join(args.workspace, "work_index_list.csv.zstd")
@@ -969,7 +969,7 @@ async def main():
     check_poppler_version()
 
     # Create work queue
-    if args.workspace.startswith("s3://"):
+    if args.workspace.startswith("s3v2://"):
         work_queue = S3WorkQueue(workspace_s3, args.workspace)
     else:
         work_queue = LocalWorkQueue(args.workspace)
@@ -980,7 +980,7 @@ async def main():
 
         for pdf_path in args.pdfs:
             # Expand s3 paths
-            if pdf_path.startswith("s3://"):
+            if pdf_path.startswith("s3v2://"):
                 logger.info(f"Expanding s3 glob at {pdf_path}")
                 pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
             elif os.path.exists(pdf_path):
