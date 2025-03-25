@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 
 
 def parse_s3_path(s3_path: str) -> tuple[str, str]:
-    if not (s3_path.startswith("s3://") or s3_path.startswith("gs://") or s3_path.startswith("weka://")):
+    if not (s3_path.startswith("s3://") or s3_path.startswith("s3v2://") or s3_path.startswith("gs://") or s3_path.startswith("weka://")):
         raise ValueError("s3_path must start with s3://, gs://, or weka://")
     parsed = urlparse(s3_path)
     bucket = parsed.netloc
@@ -59,7 +59,7 @@ def expand_s3_glob(s3_client, s3_glob: str) -> dict[str, str]:
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if glob.fnmatch.fnmatch(key, posixpath.join(prefix, pattern)):  # type: ignore
-                    matched[f"s3://{bucket}/{key}"] = obj["ETag"].strip('"')
+                    matched[f"s3v2://{bucket}/{key}"] = obj["ETag"].strip('"')
         return matched
 
     # Case 2: No wildcard → single file or a bare prefix
@@ -70,7 +70,7 @@ def expand_s3_glob(s3_client, s3_glob: str) -> dict[str, str]:
         if resp["ContentType"] == "application/x-directory":
             raise ValueError(f"'{s3_glob}' appears to be a folder. " f"Use a wildcard (e.g., '{s3_glob.rstrip('/')}/*.pdf') to match files.")
 
-        return {f"s3://{bucket}/{raw_path}": resp["ETag"].strip('"')}
+        return {f"s3v2://{bucket}/{raw_path}": resp["ETag"].strip('"')}
     except ClientError as e:
         if e.response["Error"]["Code"] == "404":
             # Check if it's actually a folder with contents
