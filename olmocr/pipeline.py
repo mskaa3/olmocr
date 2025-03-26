@@ -469,7 +469,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                 # Define the output S3 path using the work_hash
                 output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
 
-                if output_final_path.startswith("s3://"):
+                if output_final_path.startswith("s3"):
                     bucket, key = parse_s3_path(output_final_path)
                     workspace_s3.upload_file(tf.name, bucket, key)
                 else:
