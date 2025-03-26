@@ -89,7 +89,7 @@ process_pool = ProcessPoolExecutor(max_workers=min(multiprocessing.cpu_count() /
 get_pdf_filter = cache(lambda: PdfFilter(languages_to_keep={Language.ENGLISH, None}, apply_download_spam_check=True, apply_form_check=True))
 
 SGLANG_SERVER_PORT = 30024
-
+SEMAPHORE = asyncio.Semaphore(200)
 
 @dataclass(frozen=True)
 class PageResult:
@@ -211,106 +211,108 @@ async def apost(url, json_data):
 
 
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
-    COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
-    MAX_RETRIES = args.max_page_retries
-    TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
-    exponential_backoffs = 0
-    local_anchor_text_len = args.target_anchor_text_len
-    local_image_rotation = 0
-    attempt = 0
-    await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "started")
-
-    while attempt < MAX_RETRIES:
-        query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
-        query["temperature"] = TEMPERATURE_BY_ATTEMPT[
-            min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
-        ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
-
-        logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
-
-        try:
-            status_code, response_body = await apost(COMPLETION_URL, json_data=query)
-
-            if status_code == 400:
-                raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
-            elif status_code == 500:
-                raise ValueError(f"Got InternalServerError from server: {response_body}, skipping this response")
-            elif status_code != 200:
-                raise ValueError(f"Error http status {status_code}")
-
-            base_response_data = json.loads(response_body)
-
-            if base_response_data["usage"]["total_tokens"] > args.model_max_context:
-                local_anchor_text_len = max(1, local_anchor_text_len // 2)
-                logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
-                raise ValueError("Response exceeded model_max_context, cannot use this response")
-
-            metrics.add_metrics(
-                sglang_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
-                sglang_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
-            )
-
-            model_response_json = json.loads(base_response_data["choices"][0]["message"]["content"])
-            page_response = PageResponse(**model_response_json)
-
-            if not page_response.is_rotation_valid and attempt < MAX_RETRIES - 1:
-                logger.info(
-                    f"Got invalid_page rotation for {pdf_orig_path}-{page_num} attempt {attempt}, retrying with {page_response.rotation_correction} rotation"
+    global SEMAPHORE
+    async with SEMAPHORE:
+        COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
+        MAX_RETRIES = args.max_page_retries
+        TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+        exponential_backoffs = 0
+        local_anchor_text_len = args.target_anchor_text_len
+        local_image_rotation = 0
+        attempt = 0
+        await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "started")
+    
+        while attempt < MAX_RETRIES:
+            query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
+            query["temperature"] = TEMPERATURE_BY_ATTEMPT[
+                min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
+            ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+    
+            logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
+    
+            try:
+                status_code, response_body = await apost(COMPLETION_URL, json_data=query)
+    
+                if status_code == 400:
+                    raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
+                elif status_code == 500:
+                    raise ValueError(f"Got InternalServerError from server: {response_body}, skipping this response")
+                elif status_code != 200:
+                    raise ValueError(f"Error http status {status_code}")
+    
+                base_response_data = json.loads(response_body)
+    
+                if base_response_data["usage"]["total_tokens"] > args.model_max_context:
+                    local_anchor_text_len = max(1, local_anchor_text_len // 2)
+                    logger.info(f"Reducing anchor text len to {local_anchor_text_len} for {pdf_orig_path}-{page_num}")
+                    raise ValueError("Response exceeded model_max_context, cannot use this response")
+    
+                metrics.add_metrics(
+                    sglang_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
+                    sglang_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
                 )
-                local_image_rotation = page_response.rotation_correction
-                raise ValueError(f"invalid_page rotation for {pdf_orig_path}-{page_num}")
-
-            await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "finished")
-            return PageResult(
-                pdf_orig_path,
-                page_num,
-                page_response,
-                input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
-                output_tokens=base_response_data["usage"].get("completion_tokens", 0),
-                is_fallback=False,
-            )
-        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
-            logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
-
-            # Now we want to do exponential backoff, and not count this as an actual page retry
-            # Page retrys are supposed to be for fixing bad results from the model, but actual requests to sglang
-            # are supposed to work. Probably this means that the server is just restarting
-            sleep_delay = 10 * (2**exponential_backoffs)
-            exponential_backoffs += 1
-            logger.info(f"Sleeping for {sleep_delay} seconds on {pdf_orig_path}-{page_num} to allow server restart")
-            await asyncio.sleep(sleep_delay)
-        except asyncio.CancelledError:
-            logger.info(f"Process page {pdf_orig_path}-{page_num} cancelled")
-            await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "cancelled")
-            raise
-        except json.JSONDecodeError as e:
-            logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
-            attempt += 1
-        except ValueError as e:
-            logger.warning(f"ValueError on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
-            attempt += 1
-        except Exception as e:
-            logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
-            attempt += 1
-
-    logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
-    await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
-
-    return PageResult(
-        pdf_orig_path,
-        page_num,
-        PageResponse(
-            natural_text=get_anchor_text(pdf_local_path, page_num, pdf_engine="pdftotext"),
-            primary_language=None,
-            is_rotation_valid=True,
-            rotation_correction=0,
-            is_table=False,
-            is_diagram=False,
-        ),
-        input_tokens=0,
-        output_tokens=0,
-        is_fallback=True,
-    )
+    
+                model_response_json = json.loads(base_response_data["choices"][0]["message"]["content"])
+                page_response = PageResponse(**model_response_json)
+    
+                if not page_response.is_rotation_valid and attempt < MAX_RETRIES - 1:
+                    logger.info(
+                        f"Got invalid_page rotation for {pdf_orig_path}-{page_num} attempt {attempt}, retrying with {page_response.rotation_correction} rotation"
+                    )
+                    local_image_rotation = page_response.rotation_correction
+                    raise ValueError(f"invalid_page rotation for {pdf_orig_path}-{page_num}")
+    
+                await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "finished")
+                return PageResult(
+                    pdf_orig_path,
+                    page_num,
+                    page_response,
+                    input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
+                    output_tokens=base_response_data["usage"].get("completion_tokens", 0),
+                    is_fallback=False,
+                )
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
+    
+                # Now we want to do exponential backoff, and not count this as an actual page retry
+                # Page retrys are supposed to be for fixing bad results from the model, but actual requests to sglang
+                # are supposed to work. Probably this means that the server is just restarting
+                sleep_delay = 20 * (2**exponential_backoffs)
+                exponential_backoffs += 1
+                logger.info(f"Sleeping for {sleep_delay} seconds on {pdf_orig_path}-{page_num} to allow server restart")
+                await asyncio.sleep(sleep_delay)
+            except asyncio.CancelledError:
+                logger.info(f"Process page {pdf_orig_path}-{page_num} cancelled")
+                await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "cancelled")
+                raise
+            except json.JSONDecodeError as e:
+                logger.warning(f"JSON decode error on attempt {attempt} for {pdf_orig_path}-{page_num}: {e}")
+                attempt += 1
+            except ValueError as e:
+                logger.warning(f"ValueError on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
+                attempt += 1
+            except Exception as e:
+                logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
+                attempt += 1
+    
+        logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
+        await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
+    
+        return PageResult(
+            pdf_orig_path,
+            page_num,
+            PageResponse(
+                natural_text=get_anchor_text(pdf_local_path, page_num, pdf_engine="pdftotext"),
+                primary_language=None,
+                is_rotation_valid=True,
+                rotation_correction=0,
+                is_table=False,
+                is_diagram=False,
+            ),
+            input_tokens=0,
+            output_tokens=0,
+            is_fallback=True,
+        )
 
 
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
@@ -969,7 +971,7 @@ async def main():
     check_poppler_version()
 
     # Create work queue
-    if args.workspace.startswith("s3v2://"):
+    if args.workspace.startswith("s3"):
         work_queue = S3WorkQueue(workspace_s3, args.workspace)
     else:
         work_queue = LocalWorkQueue(args.workspace)
@@ -980,7 +982,7 @@ async def main():
 
         for pdf_path in args.pdfs:
             # Expand s3 paths
-            if pdf_path.startswith("s3v2://"):
+            if pdf_path.startswith("s3"):
                 logger.info(f"Expanding s3 glob at {pdf_path}")
                 pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
             elif os.path.exists(pdf_path):
